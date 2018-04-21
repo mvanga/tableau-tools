@@ -1,0 +1,134 @@
+#!/usr/bin/python
+
+import socket
+import sys
+import os
+import signal
+import sys
+import subprocess
+import random
+import time
+
+import schedgen.xen as xen
+
+CONFIG_TTXEN_TOOL = '/root/xen-xfair-4.7/tools/xcutils/ttxentool'
+
+def run_cmd(command, dry=False):
+    if dry:
+        print command
+        return None, None
+    else:
+        p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
+        p.wait()
+        out, err = p.communicate()
+        return out, err
+
+def op_push_table(path, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' push_table ' + path
+    return run_cmd(cmd, dry)
+
+def op_get_table_length():
+    pass
+
+def op_add_vcpu(dom_id, vcpu_id, cpu, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' add_vcpu ' + str(dom_id) + ' ' + str(vcpu_id) + ' ' + str(cpu)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_remove_vcpu(dom_id, vcpu_id, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' remove_vcpu ' + str(dom_id) + ' ' + str(vcpu_id)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_toggle_vcpu(dom_id, vcpu_id, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' toggle_vcpu ' + str(dom_id) + ' ' + str(vcpu_id)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_get_vcpu_info(dom_id, vcpu_id):
+    cmd = CONFIG_TTXEN_TOOL + ' get_vcpu_info ' + str(dom_id) + ' ' + str(vcpu_id)
+    out, err = run_cmd(cmd)
+    tmp = [x for x in out.rstrip().split(' ')]
+    if tmp[1] == '65535':
+        tmp[1] = -1
+    if tmp[0] == 'Tier-2':
+        return {'type': tmp[0], 'cpu': int(tmp[1])}
+    else:
+        return {'type': tmp[0]}
+
+def op_get_num_pcpus():
+    cmd = CONFIG_TTXEN_TOOL + ' get_num_pcpus'
+    out, err = run_cmd(cmd)
+    return int(out)
+
+def op_read_stats():
+    pass
+
+def get_current_vcpu_info():
+    domains = xen.get_dom_info_base()
+    info = {}
+    for k, v in domains.iteritems():
+        for vid in xrange(v['num_vcpus']):
+            name = '[' + str(v['id']) + '.' + str(vid) + ']'
+            info[name] = op_get_vcpu_info(v['id'], vid)
+    return info
+
+def get_new_vcpu_info(path):
+    info = get_current_vcpu_info()
+    with open(path + '/vcpu_maps') as f:
+        content = ['[' + x.split(' ')[0] + '.' + x.split(' ')[1] + ']' for x in f.readlines()]
+
+    for k in info.keys():
+        if info[k]['type'] == 'Tier-1' and k not in content:
+            info[k] = {}
+            info[k]['type'] = 'Tier-2'
+            info[k]['cpu'] = '0'
+
+    for vcpu in content:
+        # Flip any Tier-2 VMs with slot in new table to Tier-1
+        if info[vcpu]['type'] == 'Tier-2':
+            info[vcpu] = {}
+            info[vcpu]['type'] = 'Tier-1'
+
+    return info
+
+def toggle_tiers_pre(old, new, dry=False):
+    for k in old.keys():
+        if old[k]['type'] != new[k]['type']:
+            if new[k]['type'] == 'Tier-1':
+                dom_id = int(k.split('.')[0].strip('['))
+                vcpu_id = int(k.split('.')[1].strip(']'))
+
+                # We should remove this from all queues
+                print 'removing %s from all queues' % (k)
+                op_remove_vcpu(dom_id, vcpu_id, dry)
+
+                print 'Promoting %s: %s --> %s' % (k, old[k]['type'], new[k]['type'])
+                op_toggle_vcpu(dom_id, vcpu_id, dry)
+
+def toggle_tiers_post(old, new, dry=False):
+    for k in old.keys():
+        if old[k]['type'] != new[k]['type']:
+            if new[k]['type'] == 'Tier-2':
+                dom_id = int(k.split('.')[0].strip('['))
+                vcpu_id = int(k.split('.')[1].strip(']'))
+
+                print 'Demoting %s: %s --> %s' % (k, old[k]['type'], new[k]['type'])
+                op_toggle_vcpu(dom_id, vcpu_id, dry)
+
+                core = random.randint(0, op_get_num_pcpus() - 1)
+                print 'adding %s into random queue: CPU%d' % (k, core)
+                op_add_vcpu(dom_id, vcpu_id, core, dry)
+
+def do_push(path, dry=False):
+    old = get_current_vcpu_info()
+    new = get_new_vcpu_info(path)
+    toggle_tiers_pre(old, new, dry)
+    time.sleep(2)
+    print 'Pushing new table at: ' + path
+    op_push_table(path, dry)
+    time.sleep(2)
+    toggle_tiers_post(old, new, dry)
+
+if __name__ == '__main__':
+    do_push(sys.argv[1])

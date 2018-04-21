@@ -1,0 +1,96 @@
+#!/usr/bin/python
+
+import sys
+import os
+from optparse import OptionParser
+
+#import cProfile
+
+import schedgen.xen as xen
+import schedgen.scheduling as sched
+import schedgen.task as task
+import schedgen.edf as edf
+import schedgen.pack as pack
+
+from schedgen.utils import *
+from tests.fixture import fixture_66
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+
+    if len(sys.argv) < 2:
+        print 'usage: %s <options> <latency.conf-file>' % (sys.argv[0])
+        sys.exit(1)
+
+    parser = OptionParser()
+    parser.add_option("-f", "--fake",
+                      action="store_true", dest="fake", default=False,
+                      help="Use a fake system config")
+
+    parser.add_option('--dom0-cores', help='Number of cores to assign dom0', dest='dom0_cores', action='store', type='int', default=1)
+    parser.add_option('--domu-cores', help='Number of cores to assign each domu', dest='domu_cores', action='store', type='int', default=1)
+    parser.add_option('--num-domu', help='Number of domu to create', dest='num_domu', action='store', type='int', default=1)
+    parser.add_option('--num-cores', help='Number of cores in the system to fake', dest='num_cores', action='store', type='int', default=1)
+
+    options, arguments = parser.parse_args()
+    
+    conf = arguments[0]
+    if options.fake:
+        num_cpus = options.num_cores
+    else:
+        num_cpus = xen.get_max_cpus()
+    
+    # Load all domain information
+    if options.fake:
+        setup = xen.fakesetup(dom0_cores=options.dom0_cores,
+                              num_domu=options.num_domu,
+                              domu_cores=options.domu_cores)
+        dominfo = xen.get_dom_info(conf, info=setup)
+    else:
+        dominfo = xen.get_dom_info(conf)
+
+    # Map all domains to task structures
+    ts = task.vmlist_to_ts(dominfo, num_cpus)
+    vparams = ''
+    for t in sorted(ts, key=lambda x: x.dom_id):
+        vparams += "v%d.%d: %d / %d (burstable: %s)\n" % (t.dom_id, t.vcpu_id, t.cost, t.period, t.burstable)
+
+    if os.getenv('DEBUG', '') != '':
+        print 'VM parameters:'
+        print vparams
+
+    # Map tasks to cores (w/ APA)
+    mapping, vcpu_list, split_tasks  = sched.partition_with_splits(ts)
+    if os.getenv('DEBUG', '') != '':
+        print ts
+        print mapping
+
+    # Generate an EDF schedule for mapping (allocations of varying length)
+    l1_schedule = sched.optimize(edf.edf_schedule_generate(mapping, num_cpus))
+
+    if os.getenv('DEBUG', '') != '':
+        print 'L1 Schedule'
+        for i, core in enumerate(l1_schedule['tables']):
+            print 'CORE%d' % (i,)
+            for slot in core:
+                print slot
+
+    # Generate a sliced table (with constant-size allocations)
+    l1_slices, l1_slice_lens = sched.slice_schedule(l1_schedule)
+    if os.getenv('DEBUG', '') != '':
+        print 'L1 Slices'
+        for s in l1_slices:
+            print s
+        print l1_slice_lens
+
+    # Pack all data into a binary structure
+    packed = pack.pack_global(vcpu_list, l1_schedule, l1_slices, l1_slice_lens)
+
+    print 'total table size: ' + str(packed.length()) + ' bytes'
+
+    # Log all data to files for debugging
+    write_log('./.sched', 'vcpu_maps', sched.vcpu_list_to_str(vcpu_list))
+    write_log('./.sched', 'slots', sched.schedule_serialize(l1_schedule))
+    write_log('./.sched', 'slices', sched.slices_to_str(l1_slices))
+    write_log('./.sched', 'raw', packed.to_str())
+    write_log('./.sched', 'params', vparams)

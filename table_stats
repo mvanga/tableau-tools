@@ -1,0 +1,66 @@
+#!/usr/bin/python
+
+import sys
+from itertools import izip
+
+import re
+
+def atoi(text):
+	return int(text) if text.isdigit() else text
+
+def natural_keys(text):
+	'''
+	alist.sort(key=natural_keys) sorts in human order
+	http://nedbatchelder.com/blog/200712/human_sorting.html
+	(See Toothy's implementation in the comments)
+	'''
+	print text
+	return [ atoi(c[0]) for c in text.split('.') ]
+
+
+def pairwise(iterable):
+	"s -> (s0, s1), (s2, s3), (s4, s5), ..."
+	a = iter(iterable)
+	return izip(a, a)
+
+def get_domid(x):
+	return int(x[1])
+
+def get_vcpuid(x):
+	return int(x[2])
+
+def get_from(x):
+	return int(x[3])
+
+def get_to(x):
+	return int(x[4])
+
+if __name__ == '__main__':
+	with open(sys.argv[1] + '/slots', 'r') as f:
+		data = [x.strip().split(' ') for x in f.readlines()]
+	tlen = float(data[0][0])
+	data = data[1:]
+	
+	table = []
+	for d in data:
+		table.append([x.split(':') for x in d])
+	
+	print 'Table length:', tlen/1000000.0, 'ms'
+	print 'Number of cores:', len(table)
+	slots = {}
+	for i, c in enumerate(table):
+		for s in c:
+			if get_domid(s) != 32767:
+				name = get_domid(s)
+				if name not in slots:
+					slots[name] = []
+				slots[name].append((get_from(s), get_to(s)))
+	print 'VCPU, maximum scheduling delay, average scheduling delay'
+	for s in slots.keys():
+		mlist = []
+		for a, b in pairwise([slots[s][-1]] + slots[s]):
+			if b[0] < a[1]:
+				mlist.append(tlen - a[1] + b[0])
+			else:
+				mlist.append(b[0] - a[1])
+		print 'v' + str(s) + '.0:', max(mlist), float(sum(mlist))/len(mlist)

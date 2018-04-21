@@ -1,0 +1,250 @@
+#!/usr/bin/python
+
+import socket
+import sys
+import os
+import signal
+import sys
+import subprocess
+import random
+import time
+import math
+
+import schedgen.xen as xen
+
+CONFIG_TTXEN_TOOL = '/root/xen-xfair-4.7/tools/xcutils/ttxentool'
+
+def run_cmd(command, dry=False):
+    if dry:
+        print command
+        return None, None
+    else:
+        p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
+        p.wait()
+        out, err = p.communicate()
+        return out, err
+
+def op_push_table(path, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' push_table ' + path
+    return run_cmd(cmd, dry)
+
+def op_get_table_length():
+    pass
+
+def op_add_vcpu(dom_id, vcpu_id, cpu, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' add_vcpu ' + str(dom_id) + ' ' + str(vcpu_id) + ' ' + str(cpu)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_remove_vcpu(dom_id, vcpu_id, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' remove_vcpu ' + str(dom_id) + ' ' + str(vcpu_id)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_move_vcpu(dom_id, vcpu_id, cpu, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' move_vcpu ' + str(dom_id) + ' ' + str(vcpu_id) + ' ' + str(cpu)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_toggle_vcpu(dom_id, vcpu_id, dry):
+    cmd = CONFIG_TTXEN_TOOL + ' toggle_vcpu ' + str(dom_id) + ' ' + str(vcpu_id)
+    out, err = run_cmd(cmd, dry)
+    return err
+
+def op_get_vcpu_info(dom_id, vcpu_id):
+    cmd = CONFIG_TTXEN_TOOL + ' get_vcpu_info ' + str(dom_id) + ' ' + str(vcpu_id)
+    out, err = run_cmd(cmd)
+    tmp = [x for x in out.rstrip().split(' ')]
+    if tmp[1] == '65535':
+        tmp[1] = -1
+    if tmp[0] == 'Tier-2':
+        return {'type': tmp[0], 'cpu': int(tmp[1])}
+    else:
+        return {'type': tmp[0]}
+
+def op_get_num_pcpus():
+    cmd = CONFIG_TTXEN_TOOL + ' get_num_pcpus'
+    out, err = run_cmd(cmd)
+    return int(out)
+
+def op_read_stats(dry=False):
+    cmd = CONFIG_TTXEN_TOOL + ' read_stats ' + str(op_get_num_pcpus())
+    out, err = run_cmd(cmd, dry)
+
+    out = [x.strip() for x in out.split('\n') if x != '']
+    stats = [x.split(' ') for x in out]
+    stats = [[[int(z) for z in y.split(':')] for y in x] for x in stats]
+    core_stats = []
+    for c in stats:
+        total_time = 0
+        total_idle = 0
+        for e in c:
+            total_time += e[0]
+            total_idle += e[1]
+        core_stats.append([total_idle, total_time])
+    return core_stats
+
+def scale(val, src, dst):
+    """
+    Scale the given value from the scale of src to the scale of dst.
+    """
+    return ((val - src[0]) / (src[1]-src[0])) * (dst[1]-dst[0]) + dst[0]
+
+def balance(core_maps, core_stats):
+    # core_maps is a list (of length num. cores).
+    # each entry is a list of tier-2 vcpus on it.
+    # core_stats is a list of [idle_time, total_time] pairs (per-core)
+
+    # total_time has the utilization that's available to tier-2
+    total_time = 0
+    total = 0
+    for c in core_stats:
+        total_time += float(c[0]) / c[1]
+        total += c[0]
+
+    # num_t2_vcpus has the number of tier-2 vCPUs
+    num_t2_vcpus = 0
+    for c in core_maps:
+        num_t2_vcpus += len(c)
+
+    #num_t2_vcpus = 10
+
+    # If we have no tier-2 vCPUs, nothing to do
+    if num_t2_vcpus == 0:
+        return
+
+    # Approximate the utilization per vCPU
+    per_t2_util = float(total_time) / num_t2_vcpus
+
+    # Dedicated core scenario
+    if per_t2_util > 1.0:
+        per_t2_util = 1
+
+    # Now rebalance and determine changes
+    to_balance = []
+    csh = []
+    for i in xrange(len(core_maps)):
+        t2_util = float(core_stats[i][0]) / core_stats[i][1]
+        if t2_util < 0.1 * per_t2_util:
+            should_have = int(math.floor(float(t2_util) / per_t2_util))
+        else:
+            should_have = int(math.ceil(float(t2_util) / per_t2_util))
+        csh.append(should_have)
+
+        if should_have == len(core_maps[i]):
+            continue
+        elif should_have < len(core_maps[i]):
+            num_to_pop = len(core_maps[i]) - should_have
+            to_balance += core_maps[i][-num_to_pop:]
+            #print 'Popping ' + str(num_to_pop) + ' vcpus from core ' + str(i) + '(has=' + str(len(core_maps[i])) + ', should_have=' + str(should_have) + ')'
+
+    # We now re-assign the removed vCPUs to underutilized cores
+    balance_moves = []
+    for i in xrange(len(core_maps)):
+        should_have = csh[i]
+        if should_have > len(core_maps[i]):
+            num_to_push = should_have - len(core_maps[i])
+            #print 'Can assign ' + str(num_to_push) + ' VMs to core ' + str(i) + '(has=' + str(len(core_maps[i])) + ', should_have=' + str(should_have) + ')'
+            new_assigns = to_balance[0:num_to_push]
+            #print new_assigns
+            for v in new_assigns:
+                balance_moves.append([v, i])
+            to_balance = to_balance[num_to_push:]
+
+    # Now just execute balance_moves
+    for m in balance_moves:
+        op_move_vcpu(m[0][0], m[0][1], m[1], dry=False)
+        print '[EVENT] rebalancing [' + str(m[0][0]) + '.' + str(m[0][1]) + '] to core ' + str(m[1])
+
+def get_current_vcpu_info():
+    domains = xen.get_dom_info_base()
+    info = {}
+    for k, v in domains.iteritems():
+        for vid in xrange(v['num_vcpus']):
+            name = '[' + str(v['id']) + '.' + str(vid) + ']'
+            info[name] = op_get_vcpu_info(v['id'], vid)
+    return info
+
+def get_new_vcpu_info(path):
+    info = get_current_vcpu_info()
+    with open(path + '/vcpu_maps') as f:
+        content = ['[' + x.split(' ')[0] + '.' + x.split(' ')[1] + ']' for x in f.readlines()]
+
+    for k in info.keys():
+        if info[k]['type'] == 'Tier-1' and k not in content:
+            info[k] = {}
+            info[k]['type'] = 'Tier-2'
+            info[k]['cpu'] = '0'
+
+    for vcpu in content:
+        # Flip any Tier-2 VMs with slot in new table to Tier-1
+        if info[vcpu]['type'] == 'Tier-2':
+            info[vcpu] = {}
+            info[vcpu]['type'] = 'Tier-1'
+
+    return info
+
+def get_tier2_maps():
+    core_maps = []
+    for i in xrange(op_get_num_pcpus()):
+        core_maps.append([])
+
+    info = get_current_vcpu_info()
+    for k in info.keys():
+        if info[k]['type'] == 'Tier-2':
+            dom_id = int(k.split('.')[0].strip('['))
+            vcpu_id = int(k.split('.')[1].strip(']'))
+            cpu = info[k]['cpu']
+            core_maps[cpu].append([dom_id, vcpu_id, cpu])
+
+    return core_maps
+
+interrupted = False
+def signal_handler(signal, frame):
+    global interrupted
+    interrupted = True
+
+def print_current_vcpu_info():
+    info = get_current_vcpu_info()
+    for k in info.keys():
+        if info[k]['type'] == 'Tier-2':
+            dom_id = int(k.split('.')[0].strip('['))
+            vcpu_id = int(k.split('.')[1].strip(']'))
+            cpu = info[k]['cpu']
+            print k + ': ' + str(cpu)
+    
+# To remove cores from the balancing, just set their idle time to 0
+def apa_remove(core_stats, cores):
+    for c in cores:
+        core_stats[c][0] = 0
+    return core_stats
+
+if __name__ == '__main__':
+    if len(sys.argv) == 2 and sys.argv[1] == 'status':
+        core_maps = get_tier2_maps()
+        for i, c in enumerate(core_maps):
+            print i, ":", c
+        print ""
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    while True:
+        core_stats = op_read_stats()
+        #for i, c in enumerate(core_stats):
+        #    print i, ":", c
+
+        # Remove dom0 cores from load balancing decisions
+        core_stats = apa_remove(core_stats, [0, 1, 2, 3])
+
+        core_maps = get_tier2_maps()
+        #for i, c in enumerate(core_maps):
+        #    print i, ":", c
+        #print ""
+
+        balance(core_maps, core_stats)
+        time.sleep(1)
+
+        if interrupted:
+            print("Exiting")
+            break
